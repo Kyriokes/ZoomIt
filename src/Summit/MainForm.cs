@@ -52,6 +52,8 @@ internal sealed class MainForm : Form
         _settingsPath = settingsPath;
 
         Text = "Summit";
+        using (var icon = typeof(MainForm).Assembly.GetManifestResourceStream("Summit.ico"))
+            if (icon is not null) Icon = new Icon(icon);
         BackColor = Color.Black;
         ForeColor = TextColor;
         Font = new Font("Segoe UI", 9f);
