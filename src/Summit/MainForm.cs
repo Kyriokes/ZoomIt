@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using Microsoft.Win32;
 using Summit.Capture;
 using Summit.Core;
@@ -45,12 +46,19 @@ internal sealed class MainForm : Form
     private Mirror? _mirror;
     private int _lastFrameCount;
     private bool _loading;
+    private bool _minimized;
+    private bool _signalLost;
+    private bool _excludedFromCapture;
 
     public MainForm(Settings settings, string settingsPath)
     {
         _settings = settings;
         _settingsPath = settingsPath;
 
+        SuspendLayout();
+        // Sizes below are written for 96 DPI; WinForms scales them for the actual display.
+        AutoScaleDimensions = new SizeF(96F, 96F);
+        AutoScaleMode = AutoScaleMode.Dpi;
         Text = "Summit";
         using (var icon = typeof(MainForm).Assembly.GetManifestResourceStream("Summit.ico"))
             if (icon is not null) Icon = new Icon(icon);
@@ -58,12 +66,12 @@ internal sealed class MainForm : Form
         ForeColor = TextColor;
         Font = new Font("Segoe UI", 9f);
         MinimumSize = new Size(640, 360);
-        AutoScaleMode = AutoScaleMode.Dpi;
 
         BuildControls();
         PlaceOnStartupScreen();
+        ResumeLayout(true);
 
-        _rateTimer.Tick += (_, _) => UpdateRate();
+        _rateTimer.Tick += (_, _) => OnTick();
     }
 
     // ---- Layout ----
@@ -133,7 +141,7 @@ internal sealed class MainForm : Form
             // Only a choice made by hand is remembered; an automatic fallback (monitor unplugged)
             // must not replace it, so the chosen monitor comes back when it does.
             if (_monitorBox.SelectedItem is MonitorInfo chosen) _settings.Monitor = chosen.DeviceName;
-            ApplyMonitor();
+            ApplyMonitor(userInitiated: true);
         };
         _zoomBar.ValueChanged += (_, _) => { UpdateZoomLabel(); if (!_loading) ApplyView(); };
         _focusGrid.FocusPointChanged += (_, _) => ApplyView();
@@ -143,10 +151,9 @@ internal sealed class MainForm : Form
     private static Label Caption(string text) => new()
     {
         Text = text,
-        AutoSize = false,
-        Size = new Size(TextRenderer.MeasureText(text, new Font("Segoe UI", 9f)).Width + 4, 26),
-        TextAlign = ContentAlignment.MiddleLeft,
+        AutoSize = true,
         ForeColor = DimTextColor,
+        Padding = new Padding(0, 5, 0, 0),
         Margin = new Padding(0, 0, 4, 0),
     };
 
@@ -158,6 +165,11 @@ internal sealed class MainForm : Form
         box.ForeColor = TextColor;
         box.Width = width;
         box.Margin = new Padding(0, 2, 18, 0);
+        // A mouse wheel turned over a closed list must not switch the monitor or the FPS.
+        box.MouseWheel += (_, e) =>
+        {
+            if (!box.DroppedDown && e is HandledMouseEventArgs handled) handled.Handled = true;
+        };
     }
 
     private void PlaceOnStartupScreen()
@@ -177,8 +189,12 @@ internal sealed class MainForm : Form
 
     // ---- Lifecycle ----
 
-    [System.Runtime.InteropServices.DllImport("dwmapi.dll")]
+    [DllImport("dwmapi.dll")]
     private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int size);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetWindowDisplayAffinity(IntPtr hwnd, uint affinity);
 
     protected override void OnHandleCreated(EventArgs e)
     {
@@ -200,6 +216,9 @@ internal sealed class MainForm : Form
         _fpsBox.SelectedIndex = Math.Max(0, Array.IndexOf(Settings.FpsOptions, _settings.Fps));
         _loading = false;
 
+        // Start on the zoom: arrow keys then adjust it instead of switching the monitor.
+        ActiveControl = _zoomBar;
+
         try
         {
             _mirror = new Mirror(_view.Handle, _view.ClientSize.Width, _view.ClientSize.Height);
@@ -218,6 +237,29 @@ internal sealed class MainForm : Form
 
         SystemEvents.DisplaySettingsChanged += OnDisplaySettingsChanged;
         _rateTimer.Start();
+    }
+
+    protected override void OnResize(EventArgs e)
+    {
+        base.OnResize(e);
+        // Nothing is visible while minimized: stop capturing until the window comes back.
+        // Deferred: a resize can arrive as a message another program is waiting on, and Windows
+        // refuses the capture calls made while such a message is being handled.
+        if (IsHandleCreated) BeginInvoke(UpdatePaused);
+    }
+
+    private void UpdatePaused()
+    {
+        bool minimized = WindowState == FormWindowState.Minimized;
+        if (minimized == _minimized) return;
+        _minimized = minimized;
+        _mirror?.SetPaused(minimized);
+    }
+
+    protected override void OnMove(EventArgs e)
+    {
+        base.OnMove(e);
+        UpdateCaptureExclusion();
     }
 
     protected override void OnFormClosing(FormClosingEventArgs e)
@@ -247,6 +289,30 @@ internal sealed class MainForm : Form
         if (IsHandleCreated && !IsDisposed) BeginInvoke(RefreshMonitors);
     }
 
+    /// <summary>Once a second: show the frame rate, and look after a capture that went quiet.</summary>
+    private void OnTick()
+    {
+        if (_mirror is null) return;
+
+        int count = _mirror.FramesShown;
+        bool idle = count == _lastFrameCount;
+        _rateLabel.Text = _signalLost ? "Sin señal" : $"{count - _lastFrameCount} fps";
+        _lastFrameCount = count;
+
+        if (_minimized || !idle) return;
+        if (!_signalLost)
+        {
+            _mirror.CheckHealth();
+            return;
+        }
+
+        // Retry the lost monitor; leave the list alone while the user has it open.
+        if (_monitorBox.DroppedDown) return;
+        var listed = _monitorBox.Items.OfType<MonitorInfo>().Select(m => m.DeviceName);
+        if (Monitors.All().Select(m => m.DeviceName).SequenceEqual(listed)) ApplyMonitor(userInitiated: false);
+        else RefreshMonitors();
+    }
+
     // ---- Controls → mirror ----
 
     private void RefreshMonitors()
@@ -261,11 +327,16 @@ internal sealed class MainForm : Form
         _monitorBox.SelectedItem = monitors.FirstOrDefault(m => m.DeviceName == choice);
         _loading = false;
 
-        ApplyMonitor();
+        ApplyMonitor(userInitiated: false);
     }
 
-    private void ApplyMonitor()
+    /// <param name="userInitiated">
+    /// True when picked by hand: a failure is explained in a dialog. Automatic changes (a monitor
+    /// unplugged or reconfigured) fail quietly and are retried every second instead.
+    /// </param>
+    private void ApplyMonitor(bool userInitiated)
     {
+        UpdateCaptureExclusion();
         if (_monitorBox.SelectedItem is not MonitorInfo monitor)
         {
             _mirror?.SetMonitor(IntPtr.Zero);
@@ -275,12 +346,32 @@ internal sealed class MainForm : Form
         try
         {
             _mirror?.SetMonitor(monitor.Handle);
+            _signalLost = false;
         }
         catch (Exception ex)
         {
+            if (!userInitiated)
+            {
+                _signalLost = true;
+                return;
+            }
             MessageBox.Show(this, "No se pudo mostrar ese monitor.\n\n" + ex.Message, "Summit",
                 MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
+    }
+
+    /// <summary>
+    /// When Summit shows the monitor it is on, it leaves itself out of the capture: the view then
+    /// magnifies what is behind the window instead of an endless mirror of itself. On other
+    /// monitors the window stays visible to screenshots and screen sharing.
+    /// </summary>
+    private void UpdateCaptureExclusion()
+    {
+        if (!IsHandleCreated) return;
+        const uint WDA_NONE = 0, WDA_EXCLUDEFROMCAPTURE = 0x11;
+        bool exclude = _monitorBox.SelectedItem is MonitorInfo m && m.DeviceName == Screen.FromControl(this).DeviceName;
+        if (exclude == _excludedFromCapture) return;
+        if (SetWindowDisplayAffinity(Handle, exclude ? WDA_EXCLUDEFROMCAPTURE : WDA_NONE)) _excludedFromCapture = exclude;
     }
 
     private void ApplyView()
@@ -299,12 +390,4 @@ internal sealed class MainForm : Form
     }
 
     private void UpdateZoomLabel() => _zoomLabel.Text = $"{_zoomBar.Value / 10f:0.0}x";
-
-    private void UpdateRate()
-    {
-        if (_mirror is null) return;
-        int count = _mirror.FramesShown;
-        _rateLabel.Text = $"{count - _lastFrameCount} fps";
-        _lastFrameCount = count;
-    }
 }

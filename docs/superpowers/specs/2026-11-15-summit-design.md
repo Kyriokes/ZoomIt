@@ -49,15 +49,18 @@ particular.
 ## Decisiones de construcción (del implementador)
 
 - C# / .NET 10, WinForms para la ventana y la barra de controles.
-- Vortice.Windows para Direct3D 11 / DXGI.
+- Vortice.Windows para Direct3D 11 / DXGI. Los shaders se compilan de antemano
+  (`tools/build-shaders.ps1`), no en tiempo de ejecución.
 - Barra de controles: una tira fina arriba de la imagen con monitor, zoom, foco
   y FPS.
 - A 1x la imagen se muestra entera sin deformar (el resto queda en negro). Al
   acercar, primero llena esas franjas y después recorta hacia el foco.
 - Al lado del selector de FPS se muestra el ritmo real medido.
 - Se muestra el cursor del mouse dentro de la imagen.
-- Si el monitor elegido es el mismo donde está Summit, se muestra igual (el
-  usuario decide).
+- Si el monitor elegido es el mismo donde está Summit, la ventana se excluye de
+  la captura (`SetWindowDisplayAffinity`): funciona como lupa de lo que hay
+  detrás en vez de un espejo infinito. En otro monitor sigue siendo visible
+  para capturas y transmisiones.
 - La configuración se guarda al cerrar en
   `%AppData%\Summit\settings.json` y se restaura al abrir.
 - Límite de FPS: se descartan los cuadros que llegan antes de tiempo; solo se
@@ -66,3 +69,9 @@ particular.
   el ritmo exacto entregaba de menos: 60 pedidos daban 40).
 - Si el monitor elegido se desconecta se muestra otro, pero se recuerda el
   elegido para volver a él cuando reaparezca.
+- Minimizada, Summit detiene la captura; al restaurarla, la retoma.
+- Si la placa de video se reinicia, Summit se recupera sola (revisa una vez por
+  segundo cuando no llegan cuadros). Un monitor que falla al cambiar la
+  configuración de pantalla no abre diálogos: se muestra "Sin señal" y se
+  reintenta.
+- Una sola instancia: abrirla de nuevo trae la ventana existente.

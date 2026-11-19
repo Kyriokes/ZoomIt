@@ -1,7 +1,7 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Runtime.Versioning;
 using Summit.Core;
-using Vortice.D3DCompiler;
 using Vortice.Direct3D;
 using Vortice.Direct3D11;
 using Vortice.DXGI;
@@ -21,36 +21,29 @@ namespace Summit.Capture;
 /// </summary>
 internal sealed class Mirror : IDisposable
 {
-    private const string ShaderSource = """
-        cbuffer View : register(b0) { float2 uvOffset; float2 uvScale; };
-        Texture2D tex : register(t0);
-        SamplerState smp : register(s0);
-        struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
-        VSOut VS(uint id : SV_VertexID)
-        {
-            VSOut o;
-            float2 t = float2((id << 1) & 2, id & 2);
-            o.pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
-            o.uv = uvOffset + t * uvScale;
-            return o;
-        }
-        float4 PS(VSOut i) : SV_Target { return float4(tex.Sample(smp, i.uv).rgb, 1); }
-        """;
-
     private const DirectXPixelFormat PixelFormat = DirectXPixelFormat.B8G8R8A8UIntNormalized;
     private const int PoolBuffers = 2;
 
-    private static readonly bool HasMinUpdateInterval = ApiInformation.IsPropertyPresent(
+    // Newer capture options, checked by capability rather than by Windows version.
+    private static readonly bool MinUpdateIntervalPresent = ApiInformation.IsPropertyPresent(
         "Windows.Graphics.Capture.GraphicsCaptureSession", "MinUpdateInterval");
-    private static readonly bool HasBorderToggle = ApiInformation.IsPropertyPresent(
+    private static readonly bool BorderTogglePresent = ApiInformation.IsPropertyPresent(
         "Windows.Graphics.Capture.GraphicsCaptureSession", "IsBorderRequired");
+
+    [SupportedOSPlatformGuard("windows10.0.26100.0")]
+    private static bool HasMinUpdateInterval => MinUpdateIntervalPresent;
+
+    [SupportedOSPlatformGuard("windows10.0.20348.0")]
+    private static bool HasBorderToggle => BorderTogglePresent;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct ViewConstants { public float OffsetX, OffsetY, ScaleX, ScaleY; }
 
     private readonly object _sync = new();
     private readonly IntPtr _hwnd;
-    private readonly FrameLimiter _limiter = new(Stopwatch.Frequency);
+
+    // Fed with the frames' own timestamps, which are free of callback jitter.
+    private readonly FrameLimiter _limiter = new(TimeSpan.TicksPerSecond);
 
     // Device resources.
     private ID3D11Device? _device;
@@ -68,6 +61,7 @@ internal sealed class Mirror : IDisposable
     private Direct3D11CaptureFramePool? _pool;
     private GraphicsCaptureSession? _session;
     private SizeInt32 _poolSize;
+    private bool _paused;
 
     // The most recent frame, kept so the view can be redrawn while the source is static.
     private Direct3D11CaptureFrame? _frame;
@@ -79,6 +73,10 @@ internal sealed class Mirror : IDisposable
     private int _fps;
     private int _framesShown;
     private bool _disposed;
+
+    // Device rebuild throttling, so a GPU that is still resetting isn't hammered.
+    private long _nextRebuild;
+    private int _failedRebuilds;
 
     public static bool IsSupported => GraphicsCaptureSession.IsSupported();
 
@@ -93,13 +91,36 @@ internal sealed class Mirror : IDisposable
         CreateDeviceResources();
     }
 
+    /// <summary>Starts showing a monitor. Throws if the monitor cannot be captured.</summary>
     public void SetMonitor(IntPtr hmonitor)
     {
         lock (_sync)
         {
             if (_disposed) return;
             _monitor = hmonitor;
-            Guard(StartCapture);
+            if (_device is null) TryRebuild();
+            else Guard(StartCapture);
+        }
+    }
+
+    /// <summary>Stops capturing while nothing is visible (window minimized), and resumes after.</summary>
+    public void SetPaused(bool paused)
+    {
+        lock (_sync)
+        {
+            if (_disposed || _paused == paused) return;
+            _paused = paused;
+            if (paused)
+            {
+                StopCapture();
+                return;
+            }
+
+            Quietly(() =>
+            {
+                if (_device is null) TryRebuild();
+                else Guard(StartCapture);
+            });
         }
     }
 
@@ -110,7 +131,7 @@ internal sealed class Mirror : IDisposable
             _zoom = zoom;
             _anchorX = anchorX;
             _anchorY = anchorY;
-            Guard(Render);
+            Quietly(() => Guard(Render));
         }
     }
 
@@ -131,17 +152,44 @@ internal sealed class Mirror : IDisposable
             _width = width;
             _height = height;
             if (_disposed || width <= 0 || height <= 0) return;
-            Guard(() =>
+            Quietly(() => Guard(() =>
             {
                 ResizeSwapChain();
                 Render();
-            });
+            }));
         }
     }
 
     public void Redraw()
     {
-        lock (_sync) Guard(Render);
+        lock (_sync) Quietly(() => Guard(Render));
+    }
+
+    /// <summary>
+    /// Called about once a second when no frames are arriving: rebuilds the device if the GPU
+    /// was reset (driver update, GPU crash) and nothing else has noticed yet.
+    /// </summary>
+    public void CheckHealth()
+    {
+        lock (_sync)
+        {
+            if (_disposed || _paused) return;
+            Quietly(() =>
+            {
+                if (_device is null || _device.DeviceRemovedReason.Failure)
+                {
+                    if (TryRebuild()) Render();
+                    return;
+                }
+                // The device is fine but a capture that should be running isn't (it failed to
+                // start while the monitor was briefly gone): try again.
+                if (_session is null && _monitor != IntPtr.Zero)
+                {
+                    try { Guard(StartCapture); }
+                    catch (Exception) { /* Still unavailable; next second. */ }
+                }
+            });
+        }
     }
 
     public void Dispose()
@@ -184,8 +232,8 @@ internal sealed class Mirror : IDisposable
         }
         CreateTarget();
 
-        _vs = _device.CreateVertexShader(Compiler.Compile(ShaderSource, "VS", "Summit", "vs_4_0").Span);
-        _ps = _device.CreatePixelShader(Compiler.Compile(ShaderSource, "PS", "Summit", "ps_4_0").Span);
+        _vs = _device.CreateVertexShader(MirrorShaders.Vertex);
+        _ps = _device.CreatePixelShader(MirrorShaders.Pixel);
         _sampler = _device.CreateSamplerState(SamplerDescription.LinearClamp);
         _constants = _device.CreateBuffer(new BufferDescription(
             (uint)Marshal.SizeOf<ViewConstants>(), BindFlags.ConstantBuffer));
@@ -210,15 +258,28 @@ internal sealed class Mirror : IDisposable
 
     private void ReleaseDeviceResources()
     {
-        _winrtDevice?.Dispose(); _winrtDevice = null;
-        _constants?.Dispose(); _constants = null;
-        _sampler?.Dispose(); _sampler = null;
-        _ps?.Dispose(); _ps = null;
-        _vs?.Dispose(); _vs = null;
-        _target?.Dispose(); _target = null;
-        _swapChain?.Dispose(); _swapChain = null;
-        _context?.Dispose(); _context = null;
-        _device?.Dispose(); _device = null;
+        Release(ref _winrtDevice);
+        Release(ref _constants);
+        Release(ref _sampler);
+        Release(ref _ps);
+        Release(ref _vs);
+        Release(ref _target);
+        Release(ref _swapChain);
+        Release(ref _context);
+        Release(ref _device);
+    }
+
+    /// <summary>
+    /// Releases an object and clears the field, without ever throwing: cleanup runs on failure
+    /// paths, and some releases are calls into Windows that can fail (for example while the
+    /// window is handling a message sent by another program).
+    /// </summary>
+    private static void Release<T>(ref T? field) where T : class, IDisposable
+    {
+        var value = field;
+        field = null;
+        try { value?.Dispose(); }
+        catch (Exception) { /* Left to the finalizer. */ }
     }
 
     // ---- Capture ----
@@ -226,7 +287,7 @@ internal sealed class Mirror : IDisposable
     private void StartCapture()
     {
         StopCapture();
-        if (_monitor == IntPtr.Zero || _winrtDevice is null) return;
+        if (_paused || _monitor == IntPtr.Zero || _winrtDevice is null) return;
 
         var item = CaptureInterop.CreateItemForMonitor(_monitor);
         _poolSize = item.Size;
@@ -245,17 +306,21 @@ internal sealed class Mirror : IDisposable
 
     private void StopCapture()
     {
-        if (_pool is not null) _pool.FrameArrived -= OnFrameArrived;
-        _session?.Dispose(); _session = null;
+        if (_pool is not null)
+        {
+            try { _pool.FrameArrived -= OnFrameArrived; }
+            catch (Exception) { /* A late frame is rejected by the sender check anyway. */ }
+        }
+        Release(ref _session);
         ReleaseFrame();
-        _pool?.Dispose(); _pool = null;
+        Release(ref _pool);
     }
 
     private void ReleaseFrame()
     {
-        _frameView?.Dispose(); _frameView = null;
-        _frameTexture?.Dispose(); _frameTexture = null;
-        _frame?.Dispose(); _frame = null;
+        Release(ref _frameView);
+        Release(ref _frameTexture);
+        Release(ref _frame);
     }
 
     private void ApplyFps()
@@ -285,7 +350,11 @@ internal sealed class Mirror : IDisposable
             if (_disposed || sender != _pool) return;
             try
             {
-                Guard(() => TakeFrame(sender));
+                TakeFrame(sender);
+            }
+            catch (Exception e) when (IsDeviceLoss(e))
+            {
+                TryRebuild();
             }
             catch (Exception)
             {
@@ -307,7 +376,7 @@ internal sealed class Mirror : IDisposable
             frame = newer;
         }
 
-        if (!_limiter.ShouldRender(Stopwatch.GetTimestamp()))
+        if (!_limiter.ShouldRender(frame.SystemRelativeTime.Ticks))
         {
             frame.Dispose();
             return;
@@ -366,48 +435,93 @@ internal sealed class Mirror : IDisposable
         _swapChain.Present(0, PresentFlags.None).CheckError();
     }
 
+    // ---- Failure handling ----
+
     /// <summary>
     /// Runs a graphics operation; if the device was lost (driver update, GPU reset), rebuilds
-    /// everything and carries on. If rebuilding fails, the next operation tries again.
+    /// everything and carries on. Other errors are left to the caller.
     /// </summary>
     private void Guard(Action action)
     {
         if (_disposed) return;
-        if (_device is null && !TryRecover()) return;
+        if (_device is null && !TryRebuild()) return;
         try
         {
             action();
         }
         catch (Exception e) when (IsDeviceLoss(e))
         {
-            TryRecover();
+            TryRebuild();
         }
     }
 
-    private bool TryRecover()
+    /// <summary>
+    /// For calls coming from the window (paint, resize, controls): an error must never reach
+    /// the user as a crash dialog. Whatever failed, start over from a fresh device; the next
+    /// call or the health check rebuilds it.
+    /// </summary>
+    private void Quietly(Action action)
     {
+        try
+        {
+            action();
+        }
+        catch (Exception)
+        {
+            StopCapture();
+            ReleaseDeviceResources();
+        }
+    }
+
+    /// <summary>
+    /// Rebuilds the device and restarts the capture. A capture that can't start (the monitor
+    /// just went away) keeps the new device: the next monitor change restarts it. Attempts are
+    /// spaced out while the GPU keeps failing.
+    /// </summary>
+    private bool TryRebuild()
+    {
+        long now = Stopwatch.GetTimestamp();
+        if (now < _nextRebuild) return false;
+
         StopCapture();
         ReleaseDeviceResources();
         try
         {
             CreateDeviceResources();
-            StartCapture();
-            return true;
         }
         catch (Exception)
         {
-            // Still unavailable (GPU mid-reset): leave everything released so the next call retries.
+            ReleaseDeviceResources();
+            _failedRebuilds++;
+            _nextRebuild = now + Stopwatch.Frequency * (_failedRebuilds < 10 ? 1 : 5);
+            return false;
+        }
+
+        _failedRebuilds = 0;
+        _nextRebuild = 0;
+        try
+        {
+            StartCapture();
+        }
+        catch (Exception e) when (IsDeviceLoss(e))
+        {
             StopCapture();
             ReleaseDeviceResources();
             return false;
         }
+        catch (Exception)
+        {
+            StopCapture();
+        }
+        return true;
     }
 
     private static bool IsDeviceLoss(Exception e)
     {
         const int DeviceRemoved = unchecked((int)0x887A0005);
-        const int DeviceReset = unchecked((int)0x887A0007);
         const int DeviceHung = unchecked((int)0x887A0006);
-        return e.HResult is DeviceRemoved or DeviceReset or DeviceHung;
+        const int DeviceReset = unchecked((int)0x887A0007);
+        const int DriverInternalError = unchecked((int)0x887A0020);
+        return e.HResult is DeviceRemoved or DeviceHung or DeviceReset or DriverInternalError;
     }
 }

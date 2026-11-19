@@ -9,6 +9,11 @@ public sealed class Settings
     private const float DefaultZoom = 2f;
     private const int DefaultFps = 60;
 
+    /// <summary>A real settings file is a few hundred bytes; anything far larger is not ours.</summary>
+    private const long MaxFileSize = 64 * 1024;
+
+    private static readonly JsonSerializerOptions WriteOptions = new() { WriteIndented = true };
+
     /// <summary>Device name of the monitor being shown.</summary>
     public string? Monitor { get; set; }
 
@@ -41,7 +46,12 @@ public sealed class Settings
         Settings? s = null;
         try
         {
-            if (File.Exists(path)) s = JsonSerializer.Deserialize<Settings>(File.ReadAllText(path));
+            var file = new FileInfo(path);
+            if (file.Exists && file.Length <= MaxFileSize)
+            {
+                using var stream = file.OpenRead();
+                s = JsonSerializer.Deserialize<Settings>(stream);
+            }
         }
         catch (Exception e) when (e is JsonException or IOException or UnauthorizedAccessException)
         {
@@ -52,9 +62,26 @@ public sealed class Settings
         return s;
     }
 
+    /// <summary>
+    /// Writes the file as a whole: a new copy is written and flushed first, then swapped in, so
+    /// a crash or power cut mid-save leaves the previous settings intact.
+    /// </summary>
     public void Save(string path)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        File.WriteAllText(path, JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true }));
+        string temp = path + ".tmp";
+        try
+        {
+            using (var stream = new FileStream(temp, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                JsonSerializer.Serialize(stream, this, WriteOptions);
+                stream.Flush(flushToDisk: true);
+            }
+            File.Move(temp, path, overwrite: true);
+        }
+        finally
+        {
+            if (File.Exists(temp)) File.Delete(temp);
+        }
     }
 }

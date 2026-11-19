@@ -2,7 +2,7 @@ using System.Runtime.InteropServices;
 
 namespace Summit;
 
-internal sealed record MonitorInfo(string DeviceName, string Label, IntPtr Handle, Rectangle Bounds)
+internal sealed record MonitorInfo(string DeviceName, string Label, IntPtr Handle)
 {
     public override string ToString() => Label;
 }
@@ -23,7 +23,7 @@ internal static class Monitors
             var s = screens[i];
             var center = new Point(s.Bounds.Left + s.Bounds.Width / 2, s.Bounds.Top + s.Bounds.Height / 2);
             string label = $"Monitor {i + 1} — {s.Bounds.Width}×{s.Bounds.Height}" + (s.Primary ? " (principal)" : "");
-            list.Add(new MonitorInfo(s.DeviceName, label, MonitorFromPoint(center, MONITOR_DEFAULTTONEAREST), s.Bounds));
+            list.Add(new MonitorInfo(s.DeviceName, label, MonitorFromPoint(center, MONITOR_DEFAULTTONEAREST)));
         }
         return list;
     }

@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
@@ -13,8 +13,9 @@
     <AssemblyName>Summit</AssemblyName>
     <RootNamespace>Summit</RootNamespace>
     <PlatformTarget>x64</PlatformTarget>
-    <TieredPGO>true</TieredPGO>
     <ApplicationIcon>Summit.ico</ApplicationIcon>
+    <!-- Calling an API newer than the minimum Windows version without a guard is a bug. -->
+    <WarningsAsErrors>$(WarningsAsErrors);CA1416</WarningsAsErrors>
   </PropertyGroup>
 
   <ItemGroup>
@@ -23,7 +24,6 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Vortice.D3DCompiler" Version="3.8.3" />
     <PackageReference Include="Vortice.Direct3D11" Version="3.8.3" />
     <PackageReference Include="Vortice.DXGI" Version="3.8.3" />
   </ItemGroup>

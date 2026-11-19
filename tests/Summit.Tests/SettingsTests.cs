@@ -74,4 +74,21 @@ public class SettingsTests : IDisposable
         Assert.Equal(2f, s.Zoom);
         Assert.Equal(.5f, s.AnchorX);
     }
+
+    [Fact]
+    public void Oversized_file_gives_defaults()
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(File_)!);
+        File.WriteAllText(File_, "{\"Zoom\":3," + new string(' ', 100_000) + "\"Fps\":30}");
+        AssertDefaults(Settings.Load(File_));
+    }
+
+    [Fact]
+    public void Save_replaces_an_existing_file_and_leaves_no_temp_file()
+    {
+        new Settings { Zoom = 3 }.Save(File_);
+        new Settings { Zoom = 5 }.Save(File_);
+        Assert.Equal(5f, Settings.Load(File_).Zoom);
+        Assert.False(File.Exists(File_ + ".tmp"));
+    }
 }
