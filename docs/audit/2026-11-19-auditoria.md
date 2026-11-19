@@ -66,10 +66,13 @@ impacto real. De 39 hallazgos, 34 se confirmaron. Además se midió la app real.
 - README: cómo instalar con `dotnet publish`, requisitos de ejecución.
 - Código y paquetes sin uso eliminados; plan y spec actualizados.
 
+## Aplicado después, a pedido
+
+- **Imagen nítida con zoom alto**: cada píxel se dibuja como un bloque definido
+  y solo el borde se suaviza un píxel de pantalla. Costo casi nulo.
+
 ## Propuestas para decidir (cambian cómo se ve o se usa)
 
-- **Imagen más nítida con zoom alto**: hoy el zoom suaviza los píxeles. Un
-  filtro "nítido" mantiene bordes definidos sin pixelado duro. Costo casi nulo.
 - **Zoom con la rueda del mouse sobre la imagen** (±0,5 por paso).
 - **Nombre del monitor**: marcar "(esta ventana)" en la lista.
 - **Texto de ayuda** al pasar el mouse por el contador de fps.

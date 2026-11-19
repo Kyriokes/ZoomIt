@@ -5,7 +5,7 @@ Summit muestra en vivo, dentro de su ventana, la pantalla completa de un monitor
 ## Controles
 
 - **Monitor**: qué monitor mostrar.
-- **Zoom**: de 1x a 8x. A 1x se ve el monitor entero; al acercar, la imagen llena la ventana.
+- **Zoom**: de 1x a 8x. A 1x se ve el monitor entero; al acercar, la imagen llena la ventana. Con zoom, cada píxel se ve nítido, sin borroneado.
 - **Foco**: hacia dónde se acerca el zoom. Nueve puntos: centro, bordes y esquinas.
 - **FPS**: 15, 30, 60, 120 o Máx (el ritmo del monitor). Menos FPS, menos consumo. Al lado se ve cuántos cuadros nuevos llegan por segundo: si la imagen no cambia, no llegan cuadros.
 

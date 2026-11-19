@@ -37,7 +37,7 @@ internal sealed class Mirror : IDisposable
     private static bool HasBorderToggle => BorderTogglePresent;
 
     [StructLayout(LayoutKind.Sequential)]
-    private struct ViewConstants { public float OffsetX, OffsetY, ScaleX, ScaleY; }
+    private struct ViewConstants { public float OffsetX, OffsetY, ScaleX, ScaleY, TextureWidth, TextureHeight, Pad0, Pad1; }
 
     private readonly object _sync = new();
     private readonly IntPtr _hwnd;
@@ -418,7 +418,11 @@ internal sealed class Mirror : IDisposable
         var (dest, src) = ViewMath.Fit(_poolSize.Width, _poolSize.Height, _width, _height, _zoom, _anchorX, _anchorY);
         if (_frameView is not null && dest.Width > 0 && dest.Height > 0)
         {
-            var constants = new ViewConstants { OffsetX = src.X, OffsetY = src.Y, ScaleX = src.Width, ScaleY = src.Height };
+            var constants = new ViewConstants
+            {
+                OffsetX = src.X, OffsetY = src.Y, ScaleX = src.Width, ScaleY = src.Height,
+                TextureWidth = _poolSize.Width, TextureHeight = _poolSize.Height,
+            };
             _context.UpdateSubresource(in constants, _constants!);
 
             _context.RSSetViewport(dest.X, dest.Y, dest.Width, dest.Height);

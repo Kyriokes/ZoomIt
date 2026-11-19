@@ -75,3 +75,5 @@ particular.
   configuración de pantalla no abre diálogos: se muestra "Sin señal" y se
   reintenta.
 - Una sola instancia: abrirla de nuevo trae la ventana existente.
+- Escalado nítido: cada píxel del monitor se dibuja como un bloque y solo el
+  borde se suaviza un píxel de pantalla (pedido por el usuario el 2026-11-19).
